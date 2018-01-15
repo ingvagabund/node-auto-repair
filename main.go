@@ -4,29 +4,51 @@ import (
 	"fmt"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	kubeinformers "k8s.io/client-go/informers"
+	v1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	v1types "k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-func main() {
-	config, err := clientcmd.BuildConfigFromFlags("", "/var/run/kubernetes/admin.kubeconfig")
-	if err != nil {
-		panic(err.Error())
+/////////////////////////////
+// TODO(jchaloup):
+// - make a queue of unhealthy nodes to be processed (one node at a time)
+// - define configurable actions to be performed for unehalthy nodes
+// - ...
+
+type Controller struct {
+	nodeInformer v1informers.NodeInformer
+}
+
+func NewController(kubeInformerFactory kubeinformers.SharedInformerFactory) *Controller {
+	c := &Controller{
+		nodeInformer: kubeInformerFactory.Core().V1().Nodes(),
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
+	c.nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			c.processNodes()
+		},
+		UpdateFunc: func(old, new interface{}) {
+			c.processNodes()
+		},
+		DeleteFunc: func(obj interface{}) {
+			c.processNodes()
+		},
+	})
 
-	nodes, err := clientset.CoreV1().Nodes().List(metav1.ListOptions{})
-	if err != nil {
-		panic(err.Error())
-	}
+	return c
+}
 
-	for _, node := range nodes.Items {
+func (c *Controller) processNodes() error {
+	nodes, err := c.nodeInformer.Lister().List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
 		fmt.Printf("Checking %q node...\n", node.ObjectMeta.Name)
 
 		// Check if the node is UnReady
@@ -48,5 +70,27 @@ func main() {
 			fmt.Printf("Node %q Ready\n", node.ObjectMeta.Name)
 		}
 	}
+	return nil
+}
 
+func main() {
+
+	config, err := clientcmd.BuildConfigFromFlags("", "/var/run/kubernetes/admin.kubeconfig")
+	if err != nil {
+		panic(err.Error())
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(clientset, time.Second*30)
+
+	NewController(kubeInformerFactory)
+
+	stopCh := make(chan struct{})
+	go kubeInformerFactory.Start(stopCh)
+	time.Sleep(2 * time.Minute)
+	close(stopCh)
 }
