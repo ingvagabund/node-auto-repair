@@ -9,6 +9,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/util/workqueue"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +18,7 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	v1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/pkg/api"
 	_ "k8s.io/client-go/pkg/api/install"
 	"k8s.io/client-go/pkg/api/v1"
 	v1types "k8s.io/client-go/pkg/api/v1"
@@ -33,15 +35,17 @@ import (
 const MIN_UNREADY_DELAY = 10 * time.Minute
 
 type Controller struct {
+	kubeclientset      kubernetes.Interface
 	nodeInformerLister v1listers.NodeLister
 	nodeInformerSynced cache.InformerSynced
 	workqueue          workqueue.DelayingInterface
 }
 
-func NewController(kubeInformerFactory kubeinformers.SharedInformerFactory) *Controller {
+func NewController(kubeclientset kubernetes.Interface, kubeInformerFactory kubeinformers.SharedInformerFactory) *Controller {
 	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 
 	c := &Controller{
+		kubeclientset:      kubeclientset,
 		nodeInformerLister: nodeInformer.Lister(),
 		nodeInformerSynced: nodeInformer.Informer().HasSynced,
 		workqueue:          workqueue.NewDelayingQueue(),
@@ -49,14 +53,20 @@ func NewController(kubeInformerFactory kubeinformers.SharedInformerFactory) *Con
 
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			fmt.Printf("Adding node: %#v\n", obj)
+			// If a node is added, it is most likely in Ready state and any change
+			// gets propagated through update event, so we can ignore this
+			fmt.Printf("\n\nAdding node: %#v\n", obj)
 			c.handleObject(obj)
 		},
 		UpdateFunc: func(old, new interface{}) {
-			c.processNodes()
+			fmt.Printf("\n\nUpdating node: %#v\n", new)
+			c.handleObject(new)
 		},
 		DeleteFunc: func(obj interface{}) {
-			c.processNodes()
+			// If a node is added, it is most likely in Ready state and any change
+			// gets propagated through update event, so we can ignore this
+			fmt.Printf("\n\nDeleting node: %#v\n", obj)
+			c.handleObject(obj)
 		},
 	})
 
@@ -75,9 +85,128 @@ func (c *Controller) processNextWorkItem() bool {
 		return false
 	}
 
-	fmt.Printf("obj: %#v\n", obj)
+	// We wrap this block in a func so we can defer c.workqueue.Done.
+	err := func(obj interface{}) error {
+		// We call Done here so the workqueue knows we have finished
+		// processing this item. We also must remember to call Forget if we
+		// do not want this work item being re-queued. For example, we do
+		// not call Forget if a transient error occurs, instead the item is
+		// put back on the workqueue and attempted again after a back-off
+		// period.
+		defer c.workqueue.Done(obj)
+		var key string
+		var ok bool
+		// We expect strings to come off the workqueue. These are of the
+		// form namespace/name. We do this as the delayed nature of the
+		// workqueue means the items in the informer cache may actually be
+		// more up to date that when the item was initially put onto the
+		// workqueue.
+		if key, ok = obj.(string); !ok {
+			utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			return nil
+		}
+		// Run the syncHandler, passing it the namespace/name string of the
+		// Foo resource to be synced.
+		if err := c.syncHandler(key); err != nil {
+			return fmt.Errorf("error syncing '%s': %s", key, err.Error())
+		}
+		// Finally, if no error occurs we Forget this item so it does not
+		// get queued again until another change happens.
+		glog.Infof("Successfully synced '%s'", key)
+		return nil
+	}(obj)
+
+	if err != nil {
+		utilruntime.HandleError(err)
+		return true
+	}
 
 	return true
+}
+
+func (c *Controller) syncHandler(key string) error {
+	// Based on an action table either restart or remove a node
+	fmt.Printf("Processing %v\n", key)
+
+	node, err := c.nodeInformerLister.Get(key)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			return nil
+		}
+
+		return err
+	}
+
+	fmt.Printf("Node %v, unschedulable: %v\n", key, node.Spec.Unschedulable)
+
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == v1types.NodeReady {
+			if condition.Status == v1types.ConditionTrue {
+				// Node is in Ready state again => ignore it
+				return nil
+			}
+		}
+	}
+
+	// Make a copy of a node so the cache is not invalidated
+	copyObj, err := api.Scheme.DeepCopy(node)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Unable to duplicate a node %q: %v", node.ObjectMeta.Name, err))
+		return nil
+	}
+	nodeCopy := copyObj.(*v1.Node)
+
+	// 1. mark a node unschedulable
+	nodeCopy.Spec.Unschedulable = true
+
+	// oldData, err := json.Marshal(node)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// newData, err := json.Marshal(nodeCopy)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// TODO: use Patch instead of the Update (The patch is not currently mocked so for testing purpose sticking with the Update for now)
+	// See https://github.com/kubernetes/client-go/issues/364
+	// patch, err := strategicpatch.CreateTwoWayMergePatch(
+	// 	oldData, newData, v1.Node{},
+	// )
+	//
+	// fmt.Printf("patch: %#v\n", string(patch))
+	//
+	// if err != nil {
+	// 	utilruntime.HandleError(fmt.Errorf("Unable to create patch for node %q: %v", node.ObjectMeta.Name, err))
+	// 	return nil
+	// }
+	//
+	// n, err := c.kubeclientset.Core().Nodes().Patch(
+	// 	node.ObjectMeta.Name, types.StrategicMergePatchType, patch,
+	// )
+
+	n, err := c.kubeclientset.Core().Nodes().Update(nodeCopy)
+
+	fmt.Printf("n: %#v\nerr: %v\n\n", n, err)
+
+	return nil
+}
+
+func (c *Controller) restartNode(name string) {
+	// 1. mark a node unschedulable
+	// 1. drain a node
+	// 1. restart the node instance through a provider
+	// 1. mark a node schedulable
+
+}
+
+func (c *Controller) removeNode(name string) {
+	// 1. make a node unschedulable
+	// 1. drain a node
+	// 1. remove instance of the node from a provider
+	// 1. remove the node from the apiserver
 }
 
 func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
@@ -94,7 +223,7 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 	}
 
 	glog.Info("Starting workers")
-	// Launch two workers to process Foo resources
+
 	for i := 0; i < threadiness; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
@@ -314,7 +443,7 @@ func main() {
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(fakeCS, time.Second*30)
 
 	stopCh := make(chan struct{})
-	c := NewController(kubeInformerFactory)
+	c := NewController(fakeCS, kubeInformerFactory)
 	go c.Run(1, stopCh)
 
 	go kubeInformerFactory.Start(stopCh)
